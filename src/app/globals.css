@@ -1,0 +1,58 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #07060b;
+  --panel: #100e17;
+  --panel2: #17141f;
+  --border: #2b2538;
+  --gold: #d4af37;
+}
+
+html, body { background: var(--bg); color: #e5e7eb; }
+body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+.font-title { font-family: "Cinzel", "Trajan Pro", Georgia, "Times New Roman", serif; letter-spacing: 0.08em; }
+.font-term { font-family: ui-monospace, "JetBrains Mono", "Cascadia Code", Consolas, Menlo, monospace; }
+
+.ygg-bg {
+  background:
+    radial-gradient(ellipse at 20% -10%, rgba(120, 60, 200, 0.18), transparent 50%),
+    radial-gradient(ellipse at 90% 110%, rgba(212, 175, 55, 0.10), transparent 50%),
+    var(--bg);
+}
+.panel { background: var(--panel); border: 1px solid var(--border); }
+.panel2 { background: var(--panel2); border: 1px solid var(--border); }
+.btn { border: 1px solid var(--border); background: #1b1726; padding: 2px 8px; border-radius: 4px; font-size: 12px; transition: all .15s; white-space: nowrap; }
+.btn:hover { border-color: var(--gold); color: #fde68a; background: #231d30; }
+.btn-gold { border-color: #6b5a1f; color: #fde68a; }
+.btn-red { border-color: #6b1f2a; color: #fca5a5; }
+.btn-active { border-color: var(--gold); background: #3a2f12; color: #fde68a; }
+
+.scroll-thin::-webkit-scrollbar { width: 8px; }
+.scroll-thin::-webkit-scrollbar-thumb { background: #2b2538; border-radius: 4px; }
+
+.l-room { color: #fcd34d; font-weight: 700; }
+.l-desc { color: #cbd5e1; }
+.l-sys { color: #8b8fa3; }
+.l-info { color: #e2e8f0; }
+.l-warn { color: #fbbf24; }
+.l-dmg { color: #fb923c; }
+.l-hurt { color: #f87171; }
+.l-heal { color: #4ade80; }
+.l-magic { color: #c4b5fd; }
+.l-epic { color: #fde047; font-weight: 700; text-shadow: 0 0 8px rgba(253, 224, 71, 0.45); }
+.l-level { color: #67e8f9; font-weight: 700; }
+.l-gold { color: #fde68a; }
+.l-loot { color: #6ee7b7; }
+.l-death { color: #ef4444; font-weight: 600; }
+.l-combat { color: #fda4af; }
+.l-you { color: #7dd3fc; }
+.l-ally { color: #5eead4; }
+.l-exits { color: #a5b4fc; }
+.l-say { color: #f9a8d4; }
+.l-event { color: #f0abfc; font-weight: 600; }
+.l-cmd { color: #6b7280; }
+.l-grade-low { color: #9ca3af; } .l-grade-middle { color: #e5e7eb; } .l-grade-high { color: #4ade80; } .l-grade-top { color: #60a5fa; }
+.l-grade-relic { color: #c084fc; } .l-grade-legacy { color: #f59e0b; } .l-grade-divine { color: #f43f5e; font-weight: 600; } .l-grade-world { color: #fde047; font-weight: 700; }
+
+.bar { height: 8px; border-radius: 4px; background: #1f1b2b; overflow: hidden; }
+.bar > div { height: 100%; transition: width .3s; }
