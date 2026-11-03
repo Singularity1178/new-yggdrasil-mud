@@ -88,7 +88,7 @@ function GameScreen({ state, intro, onQuit }: { state: CharState; intro?: Line[]
   // Heals/buffs go to the selected ally (you or a summon); attacks and debuffs go to the selected enemy.
   const allyArg = ally === "me" ? "me" : `a${ally}`;
   const FRIENDLY = ["heal", "buff", "cleanse"];
-  const NO_TARGET = ["summon", "special"];
+  const NO_TARGET = ["summon", "special", "field", "trap", "utility"];
   const targetFor = (kind: string) => !inCombat || NO_TARGET.includes(kind) || kind === "passive" ? "" : ` ${FRIENDLY.includes(kind) ? allyArg : target}`;
   const castCmd = (id: string, kind: string) => `cast ${id}${metas.length ? " " + metas.join(" ") : ""}${targetFor(kind)}`;
   const allyLabel = ally === "me" ? "You" : `A${ally} ${v?.combat?.summons[ally - 1]?.name ?? ""}`.trim();
@@ -253,12 +253,18 @@ function GameScreen({ state, intro, onQuit }: { state: CharState; intro?: Line[]
               </Section>
               <Section title={`Spells (${v.spells.length})`}>
                 {v.spells.length === 0 && <div className="text-xs text-slate-500">No spells. Take a caster class.</div>}
-                {[...new Set(v.spells.map((s) => s.tier))].map((t) => (
+                {[...new Set(v.spells.filter((s) => s.kind !== "utility").map((s) => s.tier))].map((t) => (
                   <div key={t} className="mb-2">
                     <div className={`text-[11px] ${t === 11 ? "text-yellow-300" : "text-violet-300"}`}>{TIER(t)} tier</div>
-                    <div className="flex flex-wrap gap-1 mt-1">{v.spells.filter((s) => s.tier === t).map((s) => <button key={s.id} className={`btn ${t === 11 ? "btn-gold" : ""}`} title={`${s.mp} MP · ${s.kind}`} onClick={() => send(castCmd(s.id, s.kind))}>{s.name}{s.mp ? <span className="text-blue-300"> {s.mp}</span> : null}</button>)}</div>
+                    <div className="flex flex-wrap gap-1 mt-1">{v.spells.filter((s) => s.tier === t && s.kind !== "utility").map((s) => <button key={s.id} className={`btn ${t === 11 ? "btn-gold" : ""}`} title={`${s.mp} MP · ${s.kind}`} onClick={() => send(castCmd(s.id, s.kind))}>{s.name}{s.mp ? <span className="text-blue-300"> {s.mp}</span> : null}</button>)}</div>
                   </div>
                 ))}
+                {v.spells.some((s) => s.kind === "utility") && (
+                  <div className="mb-2">
+                    <div className="text-[11px] text-emerald-300">Utility · outside battle · no slots used</div>
+                    <div className="flex flex-wrap gap-1 mt-1">{v.spells.filter((s) => s.kind === "utility").map((s) => <button key={s.id} className="btn" title={`${s.mp} MP · ${TIER(s.tier)} tier utility. Many take a target: type 'cast ${s.name.toLowerCase()} <place|item>'`} onClick={() => send(`cast ${s.id}`)}>{s.name}{s.mp ? <span className="text-blue-300"> {s.mp}</span> : null}</button>)}</div>
+                  </div>
+                )}
                 <div className="flex gap-1 mt-2"><button className="btn" onClick={() => send("learn all")}>Learn all</button><button className="btn" onClick={() => send("spells all")}>All spells</button></div>
               </Section>
               <Section title="Skills">

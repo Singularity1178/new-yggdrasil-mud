@@ -2,7 +2,7 @@ import { CLASS_MAP, CLASSES } from "../data/classes";
 import { GRADES, STACKABLE, itemLabel } from "../data/items";
 import { RACE_MAP } from "../data/races";
 import { SKILL_MAP } from "../data/skills";
-import { SPELL_MAP, maxTierForLevel } from "../data/spells";
+import { SPELL_MAP, maxTierForLevel, isUtility } from "../data/spells";
 import type { ArmorType, CharState, ClassDef, Item, Line, School, Slot, StatKey, Stats, Trait, WeaponType } from "../types";
 
 export const MAX_LEVEL = 100;
@@ -100,6 +100,7 @@ export function allTraits(s: CharState): Set<Trait> {
   for (const [c, l] of classEntries(s)) for (const tr of c.traits ?? []) if (l >= tr.level) t.add(tr.trait);
   for (const it of Object.values(s.equipment)) for (const tr of it?.traits ?? []) t.add(tr);
   for (const sk of knownSkills(s)) for (const tr of SKILL_MAP[sk]?.passive?.traits ?? []) t.add(tr);
+  for (const b of s.buffs ?? []) for (const tr of b.traits ?? []) t.add(tr); // Undead Form, Aspect of Elemental...
   if (hasWorldItem(s)) t.add("world_item_holder");
   return t;
 }
@@ -114,7 +115,7 @@ export function computeStats(s: CharState): Stats {
   for (const [c, l] of classEntries(s)) for (const [k, v] of Object.entries(c.stats)) st[k as StatKey] += (v as number) * l;
   const lv = s.history.length;
   st.hp += lv * 5; st.def += lv * 0.8; st.res += lv * 0.8;
-  for (const it of Object.values(s.equipment)) if (it?.stats) for (const [k, v] of Object.entries(it.stats)) st[k as StatKey] += v as number;
+  for (const it of Object.values(s.equipment)) if (it?.stats) { const f = duraFactor(it); for (const [k, v] of Object.entries(it.stats)) st[k as StatKey] += (v as number) * f; }
   const pct: Stats = { ...ZERO };
   for (const sk of knownSkills(s)) for (const [k, v] of Object.entries(SKILL_MAP[sk]?.passive?.mods ?? {})) pct[k as StatKey] += v as number;
   for (const b of s.buffs) for (const [k, v] of Object.entries(b.mods ?? {})) pct[k as StatKey] += v as number;
@@ -167,7 +168,8 @@ export function schoolCaps(s: CharState): Partial<Record<School, number>> {
 export const casterLevels = (s: CharState) => classEntries(s).reduce((a, [c, l]) => a + l * (c.casterWeight ?? 0), 0);
 /** YGGDRASIL: roughly 300 spells at Lv100, so 3 slots per caster level */
 export const spellSlots = (s: CharState) => (Object.keys(schoolCaps(s)).length ? Math.max(4, Math.ceil(casterLevels(s) * 3)) : 0);
-export const usedSlots = (s: CharState) => s.spells.filter((id) => SPELL_MAP[id] && SPELL_MAP[id].tier < 11).length;
+/** Spell slots in use. Super Tier and utility spells (divination, travel, lifestyle) are free. */
+export const usedSlots = (s: CharState) => s.spells.filter((id) => SPELL_MAP[id] && SPELL_MAP[id].tier < 11 && !isUtility(SPELL_MAP[id])).length;
 export function spellProblems(s: CharState, spellId: string): string[] {
   const sp = SPELL_MAP[spellId];
   if (!sp) return ["unknown spell"];
@@ -176,6 +178,7 @@ export function spellProblems(s: CharState, spellId: string): string[] {
   const p: string[] = [];
   const maxT = Math.min(10, maxTierForLevel(lvl));
   if (sp.tier > maxT) p.push(`tier ${sp.tier} needs level ${sp.tier <= 1 ? 1 : 7 * (sp.tier - 1)}`);
+  if (sp.reqClass && !((s.classes[sp.reqClass] ?? 0) > 0)) p.push(`needs the ${CLASS_MAP[sp.reqClass]?.name ?? sp.reqClass} class`);
   const caps = schoolCaps(s);
   if (!sp.schools.some((sc) => caps[sc] !== undefined && (caps[sc] as number) >= sp.tier)) {
     const have = sp.schools.filter((sc) => caps[sc] !== undefined);
@@ -278,7 +281,8 @@ export function loseLevels(s: CharState, n: number, out: Line[]): number {
   const removed = s.spells.filter((id) => !keep.includes(id));
   s.spells = keep;
   while (usedSlots(s) > spellSlots(s)) {
-    const idx = s.spells.findLastIndex((id) => SPELL_MAP[id]?.tier < 11);
+    let idx = -1;
+    for (let i = s.spells.length - 1; i >= 0; i--) { const d = SPELL_MAP[s.spells[i]]; if (d && d.tier < 11 && !isUtility(d)) { idx = i; break; } }
     if (idx < 0) break;
     removed.push(s.spells[idx]);
     s.spells.splice(idx, 1);
@@ -308,4 +312,16 @@ export function fmtTime(min: number) {
 export function chronicle(s: CharState, text: string) {
   s.chronicle.push({ at: s.time, text });
   if (s.chronicle.length > 100) s.chronicle.splice(0, s.chronicle.length - 100);
+}
+
+// ───────── Durability ─────────
+/** Damaged gear (under 30%) works at 70%; broken gear (0%) gives nothing until repaired. */
+export const duraFactor = (it: Item) => (it.dura === undefined || it.dura >= 30 ? 1 : it.dura <= 0 ? 0 : 0.7);
+/** Wears down a random equipped piece (armor by default). World Items are indestructible. */
+export function wearGear(s: CharState, amt: number, out: Line[], why: string, weapon = false) {
+  const slots = (Object.keys(s.equipment) as Slot[]).filter((k) => { const it = s.equipment[k]; return !!it && it.grade !== "world" && (weapon ? k === "mainhand" : k !== "mainhand"); });
+  if (!slots.length) return;
+  const it = s.equipment[pick(slots)]!;
+  it.dura = Math.max(0, (it.dura ?? 100) - amt);
+  out.push({ t: `  ${why} ${it.name} (durability ${it.dura}%${it.dura === 0 ? ": BROKEN, it gives no stats until repaired" : ""}).`, c: "warn" });
 }

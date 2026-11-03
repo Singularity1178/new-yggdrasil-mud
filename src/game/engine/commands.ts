@@ -2,16 +2,18 @@ import { CLASSES, CLASS_MAP } from "../data/classes";
 import { CRYSTAL_KINDS, EQUIP_TYPES, FORGE, GACHA_TABLE, GRADES, GRADE_ORDER, ITEM_DEFS, MATERIAL_NAMES, genCrystal, genEquip, makeItem } from "../data/items";
 import { RACE_MAP } from "../data/races";
 import { SKILL_MAP } from "../data/skills";
-import { SPELLS, SPELL_MAP, maxTierForLevel, tierName, tierUnlockLevel } from "../data/spells";
+import { SPELLS, SPELL_MAP, maxTierForLevel, tierName, tierUnlockLevel, isUtility } from "../data/spells";
 import { MONSTER_MAP, ROOM_MAP, ROOMS, WORLDS } from "../data/world";
-import type { CharState, ClassDef, Grade, Item, Line, Room, Slot } from "../types";
+import type { CharState, ClassDef, Grade, Item, Line, Room, Slot, SpellDef } from "../types";
 import {
   ACHIEVEMENTS, addItem, addKarma, allTraits, availableClasses, buffFlags, casterLevels, charLevel, classEntries, clampVitals, computeStats,
   consumeById, countItem, equipProblems, expToNext, chronicle, findInv, fmtTime, grantAchievement, itemLabel, jobLevels, karmaLabel, knownSkills,
   levelFromExp, loseLevels, metamagicAvailable, pendingLevels, pick, proficiencies, race, racialLevels, randi, removeOne, reqProblems,
   schoolCaps, spellProblems, spellSlots, totalExpFor, usedSlots, visibleLockedClasses,
 } from "./core";
-import { endPlayerTurn, enemyPhase, handleDeath, parseAlly, parseTarget, playerAttack, playerCast, playerFlee, playerSkill, startCombat } from "./combat";
+import { endPlayerTurn, enemyPhase, handleDeath, parseAlly, parseTarget, playerAttack, playerCast, playerEscape, playerFlee, playerSkill, releaseSeal, sealable, startCombat } from "./combat";
+import { COMBAT_UTILITIES, forgeRepair, runUtility } from "./utility";
+import type { UtilityCtx } from "./utility";
 import type { AllyRef } from "./combat";
 
 type Out = Line[];
@@ -51,9 +53,15 @@ export function newCharacter(name: string, raceId: string, classId?: string): Ch
 
 function autoLearn(s: CharState, out: Out) {
   const learned: string[] = [];
-  for (const sp of SPELLS.slice().sort((a, b) => a.tier - b.tier)) {
+  // Strongest tiers first (new slots go to new magic), damage and healing before situational spells.
+  // Utility spells (divination, travel, lifestyle, crafting) are free: they never use a slot.
+  const prio: Record<string, number> = { damage: 0, death: 0, timestop: 1, heal: 1, debuff: 2, summon: 2, dispel: 3, buff: 3, cleanse: 3, trap: 3, field: 4, special: 5, utility: 6 };
+  const order = SPELLS.map((sp, i) => ({ sp, i }))
+    .sort((a, b) => Number(isUtility(a.sp)) - Number(isUtility(b.sp)) || b.sp.tier - a.sp.tier || (prio[a.sp.effect.kind] ?? 5) - (prio[b.sp.effect.kind] ?? 5) || a.i - b.i)
+    .map((x) => x.sp);
+  for (const sp of order) {
     if (s.spells.includes(sp.id) || spellProblems(s, sp.id).length) continue;
-    if (sp.tier < 11 && usedSlots(s) >= spellSlots(s)) break;
+    if (sp.tier < 11 && !isUtility(sp) && usedSlots(s) >= spellSlots(s)) continue;
     s.spells.push(sp.id); learned.push(sp.name);
   }
   if (learned.length && out) out.push({ t: `✧ New spells learned (${learned.length}): ${learned.join(", ")}`, c: "magic" });
@@ -150,6 +158,19 @@ async function rollEncounter(s: CharState, out: Out, forced = false) {
   const r = ROOM_MAP[s.room];
   if (!r.encounters?.length) { if (forced) say(out, "There's nothing to hunt here.", "warn"); return; }
   let rate = r.rate ?? 0.5;
+  if (!forced) {
+    // Travel magic: flying (Fly, Mass Fly) or stealth (Invisibility, Camouflage, Perfect Unknowable...) skips encounters.
+    const fly = s.counters.tv_fly ?? 0;
+    const sneak = s.counters.tv_stealth ?? 0;
+    if (fly > 0) { s.counters.tv_fly = fly - 1; say(out, `You fly high over the danger. (${fly - 1} flying move${fly - 1 === 1 ? "" : "s"} left)`, "magic"); return; }
+    if (sneak > 0) {
+      s.counters.tv_stealth = sneak - 1;
+      const sure = (s.counters.tv_sure ?? 0) > 0;
+      if (sneak - 1 <= 0) s.counters.tv_sure = 0;
+      if (sure || Math.random() < 0.75) { say(out, `You slip past unseen. (${sneak - 1} stealthy move${sneak - 1 === 1 ? "" : "s"} left)`, "magic"); return; }
+    }
+    if (buffFlags(s).includes("low_aggro")) rate *= 0.6;
+  }
   if (r.id === "nazarick" && race(s).category === "heteromorphic" && s.karma <= -300) { rate *= 0.5; say(out, "The tomb's guardians sense a kindred, wicked heteromorph... and hesitate.", "event"); }
   const lvl = charLevel(s);
   if (!forced && Math.random() > rate) {
@@ -201,6 +222,7 @@ export async function processCommand(s: CharState, raw: string): Promise<Out> {
       case "c": case "cast": return castCmd(s, args, out);
       case "sk": case "skill": return skillCmd(s, args, out);
       case "flee": case "run": await playerFlee(s, out); break;
+      case "release": return releaseCmd(s, args, out);
       case "use": return consumeCmd(s, args, out);
       case "look": case "l": case "enemies": enemiesLine(s, out); return out;
       case "consider": case "discern": case "con": return considerCmd(s, tgt, out);
@@ -328,6 +350,10 @@ async function general(s: CharState, cmd: string, args: string[], rest: string, 
       break;
     }
     case "consider": case "discern": say(out, "No enemies here.", "warn"); break;
+    case "release": return releaseCmd(s, args, out);
+    case "seal": { const sl = s.seal; say(out, sl?.spellId ? `Your Greater Magic Seal holds [${SPELL_MAP[sl.spellId]?.name ?? sl.spellId}]${sl.meta?.length ? ` (${sl.meta.join(", ")})` : ""}. 'release [#]' unleashes it as a free action.` : sl?.armed ? "Your Greater Magic Seal is armed: the next spell you cast will be stored in it." : "No Greater Magic Seal is active.", "magic"); break; }
+    case "repair": if (!has("forge")) say(out, "You need a forge to repair gear for gold (or cast [Repair]).", "warn"); else forgeRepair(s, rest, out); break;
+    case "mines": case "traps": { const mine = (s.traps ?? []).filter((t) => (t.until ?? 0) > s.time); say(out, mine.length ? `Your laid mines: ${mine.map((t) => `${t.name} at ${ROOM_MAP[t.room ?? ""]?.name ?? "?"} (${Math.max(1, Math.ceil(((t.until ?? 0) - s.time) / 60))}h left)`).join(", ")}` : "You have no magic mines laid.", "magic"); break; }
     default: say(out, `Unknown command '${cmd}'. Type 'help'.`, "warn");
   }
   return out;
@@ -343,8 +369,9 @@ function help(out: Out, topic: string) {
     ["Items", "inv · eq · equip <item> · unequip <slot> · appraise <item> · drop · embed (shows a how-to) · embed <crystal> into <item> · use <item>"],
     ["Town", "shop · buy <item|gear <type> [grade]|crystal <kind>> · sell · forge <type> <grade> · rest · bind · donate <gold> · gacha [n] · defile (dark altar)"],
     ["Death", "respawn · revive <token|true|resurrection|raise> · recover (your dropped item)"],
+    ["Magic", "cast <utility> [args] outside battle: compass / mass compass / lead of yatagarasu / bless of titania <area|boss|town> · floating eye · tremor sense · detect life · detect magic · remote viewing / god's eye <area|boss> · planar eye <world> · message [name] · locate object [shop|forge...] · teleportation / greater teleportation / gate <place> · repair / appraisal <item> · create greater item <gear> · release [#] (Greater Magic Seal) · seal · mines · repair <item> (at a forge, for gold)"],
     ["Info", "chronicle · worlditems · ach · time"],
-    ["Lore", "lore tiers · lore death · lore karma · lore races · lore items · lore crystals · lore timestop · lore death_magic · lore super · lore world · lore classes"],
+    ["Lore", "lore tiers · lore magic · lore death · lore karma · lore races · lore items · lore crystals · lore timestop · lore death_magic · lore super · lore world · lore classes"],
   ];
   say(out, "═══ YGGDRASIL — Commands ═══", "room");
   for (const [h, t] of H) say(out, `${h}: ${t}`, "sys");
@@ -354,6 +381,14 @@ function loreCmd(topic: string, out: Out) {
   const L: Record<string, string[]> = {
     tiers: ["Tier Magic runs from 0th tier (cantrips) through 1st–10th tier, plus Super Tier.", "THE 7 RULE: tier N unlocks at total level 7×(N−1). 1st at Lv1, 2nd at Lv7, 3rd at 14, 4th at 21, 5th at 28, 6th at 35, 7th at 42, 8th at 49, 9th at 56, 10th at 63. Super Tier unlocks at Lv70.", "Each caster class caps the tier you can reach in its school (for example, a Paladin's divine magic stops at 6th).", "You get about 3 spell slots per caster level, roughly 300 spells at Lv100. Momonga's 718 was an anomaly.", "Metamagic: Boost (1 caster level), Maximize (10), Twin (20), Widen (25), Penetrate (35), Triplet (50). Ainz's signature is Triplet Maximize Magic."],
     death: ["YGGDRASIL death penalty: lose 5 levels and drop one equipped item. Your most recently gained class levels are removed first, so dying is also the common way to rebuild a character.", "Players stop at level 1 and are never deleted.", "Raise Dead cuts the loss to −4 levels, Resurrection to −3, True Resurrection to −2. A cash item cuts it to a small amount of EXP.", "Scribe resurrection scrolls by casting those spells out of combat, or buy them in towns."],
+    magic: [
+      "Beyond damage and healing, magic now controls (Sleep, Sandman's Sand, Hold, Paralysis, Charm/Dominate, Insanity, Temporal Stasis), counters magic (Dispel Magic, Magic Destruction, Resist Break, Dimensional Lock, Delay Teleportation, Greater Rejection), wards (Body of Effulgent Beryl/Aquamarine/Heliodor, Protection Energy, Indomitability, Force Sanctuary, Translocation Damage, Mercy of Shorea Robusta), lays traps (Explode Mine) and bends time (Time Accelerator).",
+      "Some foes teleport away when badly hurt (no rewards!), call teleporting reinforcements, lock space around you or turn invisible. Lopsided Duel and Dimensional Lock stop escapes, Delay Teleportation stalls reinforcements, Greater Rejection cancels summons, and See Invisibility, area spells or Continual Light find the invisible.",
+      "New damage types: silver (bane of demons and the undead; armor blunts it) and typeless damage (True Dark, Dark, Explode Mine), which nothing resists. Shining Burst hurts the wicked and spares the good; Energy Drain steals levels.",
+      "Utility spells (divination, travel, crafting, lifestyle) don't use spell slots and are cast outside battle: compass, floating eye, remote viewing, god's eye, message, teleportation, gate, repair, appraisal, create greater item and more. Fly, Invisibility and their kin also make your next moves encounter-free.",
+      "Metamagic only applies where it makes sense; anything else is dropped and not charged. On buffs, Maximize lasts 50% longer and Boost is 20% stronger. Twin/Triplet Explode Mine lays 2/3 mines. Maximize/Boost add a turn to battlefield magic.",
+      "Greater Magic Seal stores your next spell, and 'release' fires it later as a free action. Gear has durability: acid and Greater Break Item wear it down. Mend it with [Repair] or 'repair' at a forge.",
+    ],
     karma: ["Karma ranges from −500 (Extremely Evil, like Ainz and Demiurge) to +500 (Extremely Good).", "It gates classes: Paladin needs 100 or more, Hierophant 300 or more, Dark Knight −100 or less, Assassin 0 or less, Fallen Angel −100 or less, Seraph 300 or more.", "It gates items too, like Holy Avenger, Abyssal Blade and Staff of Hel.", "Holy damage hurts evil targets more and unholy hurts good ones. Uriel does full damage only at +500 karma.", "Raise karma by killing evil foes, aiding travellers and donating at temples. Lower it by killing good beings, robbing and defiling dark altars."],
     races: ["Humanoid (Human, Elf, Dark Elf, Dwarf): few or no racial levels, so more room for job classes. Welcome everywhere.", "Demi-human (Goblin, Orc, Lizardman, Beastman, Ogre): racial trees and a 20% surcharge in human cities.", "Heteromorphic (Undead, Demon, Insect, Slime, Doppelganger, Angel, Dragonoid, Werewolf, Automaton): powerful racial classes and traits. Barred from human cities and hunted by PKers.", "Racial and job levels share the 100-level cap. Momonga: 40 racial levels (Skeleton Mage → Elder Lich → Overlord) plus 60 job levels."],
     items: ["Grades: Low → Middle → High → Top → Relic → Legacy → Divine (God-Class) → World Item.", "Gear is upgraded with DATA CRYSTALS dropped by monsters (type 'lore crystals' or just 'embed' to learn how). Each grade has a crystal capacity, and Divine gear holds the most.", "Forging needs rare metals: Iron, Mithril, Orichalcum, Adamantite, Star Silver, Celestial Uranium.", "Restrictions: classes limit weapons and armor (a pure caster can't wield a sword; it slips from their grasp unless Perfect Warrior is active). Some items also have race, class or karma restrictions."],
@@ -475,6 +510,7 @@ function spellsCmd(s: CharState, q: string, out: Out) {
   const byTier: Record<number, string[]> = {};
   for (const id of s.spells) { const sp = SPELL_MAP[id]; if (sp) (byTier[sp.tier] ??= []).push(`${sp.name}${sp.mp ? ` (${sp.mp}mp)` : ""}`); }
   for (const t of Object.keys(byTier).map(Number).sort((a, b) => a - b)) say(out, `${tierName(t)}: ${byTier[t].join(", ")}`, t === 11 ? "epic" : "magic");
+  if (s.spells.some((id) => SPELL_MAP[id] && isUtility(SPELL_MAP[id]))) say(out, "(Utility spells (divination, travel, lifestyle, crafting) don't use spell slots. Cast them outside battle, e.g. 'cast compass boss'.)", "sys");
   if (!s.spells.length) say(out, "You know no spells. Take a caster class (Wizard, Cleric, Druid, Necromancer...) or a magic racial class.", "sys");
   if (q === "all") {
     say(out, "═══ All spells in YGGDRASIL (✓ learnable now) ═══", "room");
@@ -491,7 +527,7 @@ function learnCmd(s: CharState, q: string, out: Out) {
   if (s.spells.includes(sp.id)) { say(out, "You already know it."); return; }
   const pr = spellProblems(s, sp.id);
   if (pr.length) { say(out, `You can't learn ${sp.name}: ${pr.join(", ")}`, "warn"); return; }
-  if (sp.tier < 11 && usedSlots(s) >= spellSlots(s)) { say(out, "No free spell slots. 'forget' a spell first.", "warn"); return; }
+  if (sp.tier < 11 && !isUtility(sp) && usedSlots(s) >= spellSlots(s)) { say(out, "No free spell slots. 'forget' a spell first.", "warn"); return; }
   s.spells.push(sp.id); say(out, `Learned ${sp.name}!`, "magic");
 }
 function skillsList(s: CharState, out: Out) {
@@ -503,8 +539,9 @@ function skillsList(s: CharState, out: Out) {
   }
 }
 
+const utilCtx: UtilityCtx = { look, hubFor, barred };
 async function castCmd(s: CharState, args: string[], out: Out): Promise<Out> {
-  if (!args.length) { say(out, "Cast what? e.g. 'cast fireball', 'cast magic arrow triplet maximize 2'", "warn"); return out; }
+  if (!args.length) { say(out, "Cast what? e.g. 'cast fireball', 'cast magic arrow triplet maximize 2', 'cast compass boss'", "warn"); return out; }
   const metaWords = ["maximize", "twin", "triplet", "widen", "penetrate", "boost"];
   const metas = args.filter((a) => metaWords.includes(a.toLowerCase())).map((a) => a.toLowerCase());
   let words = args.filter((a) => !metaWords.includes(a.toLowerCase()));
@@ -512,23 +549,62 @@ async function castCmd(s: CharState, args: string[], out: Out): Promise<Out> {
   let ally: AllyRef | null = null;
   const last = words[words.length - 1];
   if (words.length > 1 && last && parseAlly(last)) { ally = parseAlly(last); words = words.slice(0, -1); }
-  else if (last && /^\d+$/.test(last)) { tgt = parseInt(last, 10) - 1; words = words.slice(0, -1); }
+  else if (words.length > 1 && last && /^\d+$/.test(last)) { tgt = parseInt(last, 10) - 1; words = words.slice(0, -1); }
   let wish: string | undefined;
   if (["restore", "annihilate", "treasure", "fortune"].includes((words[words.length - 1] ?? "").toLowerCase()) && words.length > 1) wish = words.pop()!.toLowerCase();
-  const sp = findSpell(words.join(" "), s.spells);
+  // The spell is the longest leading phrase that names a known spell; anything after it is an argument (a place, an item...).
+  let sp: SpellDef | undefined;
+  let extra: string[] = [];
+  for (let n = words.length; n >= 1 && !sp; n--) { sp = findSpell(words.slice(0, n).join(" "), s.spells); if (sp) extra = words.slice(n); }
   if (!sp) { say(out, `You don't know '${words.join(" ")}'. ('spells' to list known spells.)`, "warn"); return out; }
   if (spellProblems(s, sp.id).length) { say(out, `You can't cast ${sp.name}: ${spellProblems(s, sp.id).join(", ")}`, "warn"); return out; }
   if (s.combat?.perfectWarrior || buffFlags(s).includes("perfect_warrior")) { say(out, "Perfect Warrior is active. You can't cast spells!", "warn"); return out; }
+  if (buffFlags(s).includes("no_cast")) { say(out, "Ultimate Disturb has wrecked your spellcasting. You can't cast until it wears off.", "warn"); return out; }
   if (s.statuses.some((x) => x.id === "silence")) { say(out, "You are silenced!", "warn"); return out; }
   const avail = metamagicAvailable(s);
   const bad = metas.filter((m) => !avail.includes(m));
   if (bad.length) { say(out, `You haven't mastered: ${bad.join(", ")} (available: ${avail.join(", ") || "none"}).`, "warn"); return out; }
   const eff = sp.effect;
+  const util = eff.kind === "utility";
+  const sealing = !!s.seal?.armed && sealable(sp);
+  if (util && tgt !== null) { extra = [String(tgt + 1), ...extra]; tgt = null; }
   if (!s.combat) {
+    if (sealing) { await playerCast(s, sp.id, metas, tgt, out, { ally }); return out; }
+    if (util) { await runUtility(s, sp, eff.utility ?? "", extra, out, utilCtx); return out; }
     if (eff.kind === "special" && eff.special && eff.special !== "wish") return outOfCombatSpell(s, sp.id, words, out);
+    if (eff.kind === "field" && eff.field !== "seal") { say(out, `${sp.name} only works in battle.`, "warn"); return out; }
+    if (eff.kind === "dispel" && ally !== "self") { say(out, "There's no enemy magic to dispel here. ('cast dispel me' clears your own afflictions.)", "warn"); return out; }
     if (["damage", "death", "debuff", "timestop", "summon"].includes(eff.kind)) { say(out, "There's no target here.", "warn"); return out; }
-  } else if (eff.kind === "special" && eff.special && eff.special !== "wish") { say(out, "You can't do that in combat.", "warn"); return out; }
+    const mpBefore = s.mp;
+    await playerCast(s, sp.id, metas, tgt, out, { wish, ally });
+    // Dual-use spells (Fly, Invisibility, Camouflage...) also take effect on travel outside battle.
+    if (sp.ooc && s.mp < mpBefore) await runUtility(s, sp, sp.ooc, extra, out, utilCtx, true);
+    return out;
+  }
+  if (util && !sealing) {
+    if (eff.escape) { if (await playerEscape(s, sp.id, out)) await escapeTo(s, sp, extra, out); else if (s.combat) enemiesLine(s, out); return out; }
+    if (COMBAT_UTILITIES.includes(eff.utility ?? "")) { await runUtility(s, sp, eff.utility ?? "", extra, out, utilCtx); enemiesLine(s, out); return out; }
+    say(out, `You can't cast ${sp.name} in battle.`, "warn");
+    return out;
+  }
+  if (eff.kind === "special" && eff.special && eff.special !== "wish") { say(out, "You can't do that in combat.", "warn"); return out; }
   await playerCast(s, sp.id, metas, tgt, out, { wish, ally });
+  if (s.combat) enemiesLine(s, out);
+  return out;
+}
+/** Where battle-escape teleports land: Dimensional Move stays put; the rest go home, to town, or to a named place. */
+async function escapeTo(s: CharState, sp: SpellDef, extra: string[], out: Out) {
+  if (sp.effect.escape === "blink") { await look(s, out); return; }
+  if (extra.length && (await runUtility(s, sp, "teleport", extra, out, utilCtx, true))) return;
+  s.room = sp.effect.escape === "home" ? s.respawn : hubFor(s, ROOM_MAP[s.room].world);
+  await look(s, out);
+}
+/** 'release [#|me|a#]': unleash the spell held in your Greater Magic Seal (a free action). */
+async function releaseCmd(s: CharState, args: string[], out: Out): Promise<Out> {
+  const last = args[args.length - 1];
+  const ally = last ? parseAlly(last) : null;
+  const tgt = !ally && last && /^\d+$/.test(last) ? parseInt(last, 10) - 1 : null;
+  await releaseSeal(s, tgt, out, ally);
   if (s.combat) enemiesLine(s, out);
   return out;
 }
@@ -717,7 +793,9 @@ function appraiseCmd(s: CharState, q: string, out: Out) {
   if (it.type === "crystal") say(out, `To use: 'embed ${(s.inventory.indexOf(it) + 1) || "<number>"} into <gear>'${it.element ? " (weapons only)" : ""} — permanent. Type 'embed' for a list of gear with free slots.`, "heal");
   else if (it.capacity !== undefined) say(out, (it.crystals?.length ?? 0) < it.capacity ? `${it.capacity - (it.crystals?.length ?? 0)} free crystal slot(s). Type 'embed' to see how to fill them.` : "All crystal slots are full.", "sys");
   if (it.slot) { const pr = equipProblems(s, it); say(out, pr.length ? `✗ ${pr.join("; ")}` : "✓ You can equip this.", pr.length ? "warn" : "heal"); }
-  say(out, `Value: ${Math.round(it.price * 0.4)} gold`, "gold");
+  if (it.dura !== undefined && it.dura < 100) say(out, it.dura <= 0 ? "BROKEN: it gives no stats until repaired ([Repair], or 'repair' at a forge)." : `Durability ${it.dura}%${it.dura < 30 ? " (damaged: its stats work at 70%)" : ""}.`, "warn");
+  if (it.conjured) say(out, "Conjured by [Create Greater Item]: worthless to merchants, and it fades if you die.", "magic");
+  say(out, `Value: ${Math.round(it.price * 0.4 * (it.appraised ? 1.3 : 1))} gold${it.appraised ? " (appraised)" : ""}`, "gold");
 }
 
 const BUY_CRYSTALS = ["str", "int", "vit", "spi", "grd", "wrd", "swf", "fire", "ice", "lightning", "fireward", "iceward"];
@@ -754,7 +832,8 @@ function sellCmd(s: CharState, q: string, out: Out) {
   const it = findInv(s, q);
   if (!it) { say(out, "You don't have that.", "warn"); return; }
   if (it.grade === "world" || it.type === "cash") { say(out, "That can't be sold.", "warn"); return; }
-  const v = Math.max(1, Math.round(it.price * 0.4));
+  if (it.conjured) { say(out, "Merchants won't pay for conjured gear: it would vanish in their hands.", "warn"); return; }
+  const v = Math.max(1, Math.round(it.price * 0.4 * (it.appraised ? 1.3 : 1)));
   removeOne(s, it.uid); s.gold += v; say(out, `Sold ${it.name} for ${v}g.`, "gold");
 }
 function forgeCmd(s: CharState, args: string[], out: Out) {
@@ -879,7 +958,11 @@ async function restCmd(s: CharState, out: Out) {
     return;
   }
   s.time += 240;
-  if (Math.random() < 0.35 && r.encounters?.length) { say(out, "You're ambushed while resting!", "warn"); await rollEncounter(s, out, true); return; }
+  const warded = (s.counters.alarm_until ?? 0) >= s.time - 240 || buffFlags(s).includes("keen_ears");
+  if (Math.random() < 0.35 && r.encounters?.length) {
+    if (warded) say(out, "Something creeps toward your camp... your warning magic rings out, and it slinks away.", "magic");
+    else { say(out, "You're ambushed while resting!", "warn"); await rollEncounter(s, out, true); return; }
+  }
   s.hp = Math.min(st.hp, s.hp + Math.round(st.hp * 0.5)); s.mp = Math.min(st.mp, s.mp + Math.round(st.mp * 0.5));
   say(out, "You rest uneasily in the wild and recover 50% of your HP and MP.", "heal");
 }

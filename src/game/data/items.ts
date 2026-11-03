@@ -194,7 +194,8 @@ export const STACKABLE = (it: Item) => it.type === "consumable" || it.type === "
 export function itemLabel(it: Item): string {
   const g = GRADES[it.grade];
   const cr = it.capacity ? ` [${it.crystals?.length ?? 0}/${it.capacity}]` : "";
-  return `${it.name}${it.qty && it.qty > 1 ? ` x${it.qty}` : ""} <${g.name}>${it.level > 1 && it.type !== "consumable" && it.type !== "material" ? ` Lv${it.level}` : ""}${cr}`;
+  const tags = `${it.conjured ? " [Conjured]" : ""}${it.dura !== undefined && it.dura < 100 ? ` [${it.dura <= 0 ? "BROKEN" : `${it.dura}%`}]` : ""}${it.appraised ? " ✓" : ""}`;
+  return `${it.name}${it.qty && it.qty > 1 ? ` x${it.qty}` : ""} <${g.name}>${it.level > 1 && it.type !== "consumable" && it.type !== "material" ? ` Lv${it.level}` : ""}${cr}${tags}`;
 }
 
 export const GACHA_TABLE: { id: string; w: number }[] = [
